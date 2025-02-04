@@ -116,32 +116,34 @@ def find_part_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_
 
     # cluster all images using k-means:
     all_descriptors = np.ascontiguousarray(np.concatenate(descriptors_list, axis=2)[0, 0]) # descriptors_list: list of bhtd; after np.concatenate: bh(nt)d, where n is the num of img_paths
-                                                                                           # final: ntd, the 0th of batch and 0th head.
+                                                                                           # final: (nt)d, the 0th of batch and 0th head.
     normalized_all_descriptors = all_descriptors.astype(np.float32)
     faiss.normalize_L2(normalized_all_descriptors)  # in-place operation
-    sampled_descriptors_list = [x[:, :, ::sample_interval, :] for x in descriptors_list] # sample_interval:
-    all_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_descriptors_list, axis=2)[0, 0])
+    sampled_descriptors_list = [x[:, :, ::sample_interval, :] for x in descriptors_list] # x: bhtd, sample every sample_interval tokens in x;
+    all_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_descriptors_list, axis=2)[0, 0]) # final: (nt1)d
     normalized_all_sampled_descriptors = all_sampled_descriptors.astype(np.float32)
     faiss.normalize_L2(normalized_all_sampled_descriptors)  # in-place operation
 
     sum_of_squared_dists = []
     n_cluster_range = list(range(1, 15))
     for n_clusters in n_cluster_range:
-        algorithm = faiss.Kmeans(d=normalized_all_sampled_descriptors.shape[1], k=n_clusters, niter=300, nredo=10)
-        algorithm.train(normalized_all_sampled_descriptors.astype(np.float32))
-        squared_distances, labels = algorithm.index.search(normalized_all_descriptors.astype(np.float32), 1)
-        objective = squared_distances.sum()
+        algorithm = faiss.Kmeans(d=normalized_all_sampled_descriptors.shape[1], k=n_clusters, niter=300, nredo=10) # nredo：nredo 参数会控制算法在不同的初始簇中心点下多次运行，并选取结果最好的那一次
+        algorithm.train(normalized_all_sampled_descriptors.astype(np.float32)) # 对（nt1d）个tensor进行聚类
+        squared_distances, labels = algorithm.index.search(normalized_all_descriptors.astype(np.float32), 1) # 对 normalized_all_descriptors 进行最近邻搜索；返回每个点的 最近 1 个 聚类中心（即最近簇中心）以及标签
+        objective = squared_distances.sum() # squared_distances：每个点的 最近 1 个 聚类中心（即最近簇中心）。;objective:总距离
         sum_of_squared_dists.append(objective / normalized_all_descriptors.shape[0])
-        if (len(sum_of_squared_dists) > 1 and sum_of_squared_dists[-1] > elbow * sum_of_squared_dists[-2]):
+        if (len(sum_of_squared_dists) > 1 and sum_of_squared_dists[-1] > elbow * sum_of_squared_dists[-2]):# 聚类停止条件
             break
 
     num_labels = np.max(n_clusters) + 1
     num_descriptors_per_image = [num_patches[0]*num_patches[1] for num_patches in num_patches_list]
-    labels_per_image = np.split(labels, np.cumsum(num_descriptors_per_image)[:-1])
+    labels_per_image = np.split(labels, np.cumsum(num_descriptors_per_image)[:-1]) # np.cumsum(num_descriptors_per_image) 计算 num_descriptors_per_image 中每个元素的累计和，返回一个表示每张图片描述符数量累加的数组。
+                                                                                   # 例如，如果 num_descriptors_per_image = [12, 30]，则 np.cumsum([12, 30]) 会返回 [12, 42]，表示第一张图有 12 个标签，第二张图有 42 个标签。
+                                                                                   # np.split(labels, np.cumsum(num_descriptors_per_image)[:-1]) 通过这些分割点，将 labels 数组按图片划分成多个子数组。每个子数组对应一张图片的标签。
 
     if save_dir is not None:
         cmap = 'jet' if num_labels > 10 else 'tab10'
-        for image_path, num_patches, label_per_image in zip(image_paths, num_patches_list, labels_per_image):
+        for image_path, num_patches, label_per_image in zip(image_paths, num_patches_list, labels_per_image): # num_patches_list：lsit of original shapes btd;
             if not ('_aug_' in Path(image_path).stem):
                 fig, ax = plt.subplots()
                 ax.axis('off')
@@ -151,24 +153,25 @@ def find_part_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_
 
     # use saliency maps to vote for salient clusters (only original images vote, not augmentations)
     votes = np.zeros(num_labels)
-    for image_path, image_labels, saliency_map in zip(image_paths, labels_per_image, saliency_maps_list):
+    for image_path, image_labels, saliency_map in zip(image_paths, labels_per_image, saliency_maps_list): # saliency_map：bx(t-1)
         if not ('_aug_' in Path(image_path).stem):
             for label in range(num_labels):
-                label_saliency = saliency_map[image_labels[:, 0] == label].mean()
+                label_saliency = saliency_map[image_labels[:, 0] == label].mean() # 聚类被分为第k类的patch在attn上（clstoken和其他的attn）求取attn均值
+                                                                                  # 反映了“置信度”
                 if label_saliency > thresh:
-                    votes[label] += 1
+                    votes[label] += 1 # 一维array的第k维+1，这几步在把图中最可能存在的label给筛出来
     salient_labels = np.where(votes >= np.ceil(num_images * votes_percentage / 100))[0]
 
     # cluster all parts using k-means:
-    fg_masks = [np.isin(labels, salient_labels) for labels in labels_per_image]  # get only foreground descriptors
-    fg_descriptor_list = [desc[:, :, fg_mask[:, 0], :] for fg_mask, desc in zip(fg_masks, descriptors_list)]
-    all_fg_descriptors = np.ascontiguousarray(np.concatenate(fg_descriptor_list, axis=2)[0, 0])
+    fg_masks = [np.isin(labels, salient_labels) for labels in labels_per_image]  # get only foreground descriptors # bt, length: n_class
+    fg_descriptor_list = [desc[:, :, fg_mask[:, 0], :] for fg_mask, desc in zip(fg_masks, descriptors_list)] # b h t_f d, length: n_class
+    all_fg_descriptors = np.ascontiguousarray(np.concatenate(fg_descriptor_list, axis=2)[0, 0]) # 0th in batch 0th in head, shape: n_class*t_f d
     normalized_all_fg_descriptors = all_fg_descriptors.astype(np.float32)
     faiss.normalize_L2(normalized_all_fg_descriptors)  # in-place operation
-    sampled_fg_descriptors_list = [x[:, :, ::sample_interval, :] for x in fg_descriptor_list]
-    all_fg_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_fg_descriptors_list, axis=2)[0, 0])
+    sampled_fg_descriptors_list = [x[:, :, ::sample_interval, :] for x in fg_descriptor_list] # b h t_f_selected d, length: n_class
+    all_fg_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_fg_descriptors_list, axis=2)[0, 0]) # n_class*t_f_selected d
     normalized_all_fg_sampled_descriptors = all_fg_sampled_descriptors.astype(np.float32)
-    faiss.normalize_L2(normalized_all_fg_sampled_descriptors)  # in-place operation
+    faiss.normalize_L2(normalized_all_fg_sampled_descriptors)  # in-place operation # normed
 
     sum_of_squared_dists = []
     # if applying three stages, use elbow to determine number of clusters in second stage, otherwise use the specified
