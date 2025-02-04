@@ -115,10 +115,11 @@ def find_part_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_
             image_pil.save(save_dir / f'{Path(image_path).stem}_resized.png')
 
     # cluster all images using k-means:
-    all_descriptors = np.ascontiguousarray(np.concatenate(descriptors_list, axis=2)[0, 0])
+    all_descriptors = np.ascontiguousarray(np.concatenate(descriptors_list, axis=2)[0, 0]) # descriptors_list: list of bhtd; after np.concatenate: bh(nt)d, where n is the num of img_paths
+                                                                                           # final: ntd, the 0th of batch and 0th head.
     normalized_all_descriptors = all_descriptors.astype(np.float32)
     faiss.normalize_L2(normalized_all_descriptors)  # in-place operation
-    sampled_descriptors_list = [x[:, :, ::sample_interval, :] for x in descriptors_list]
+    sampled_descriptors_list = [x[:, :, ::sample_interval, :] for x in descriptors_list] # sample_interval:
     all_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_descriptors_list, axis=2)[0, 0])
     normalized_all_sampled_descriptors = all_sampled_descriptors.astype(np.float32)
     faiss.normalize_L2(normalized_all_sampled_descriptors)  # in-place operation
